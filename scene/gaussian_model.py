@@ -20,6 +20,7 @@ from utils.sh_utils import RGB2SH
 from simple_knn._C import distCUDA2
 from utils.graphics_utils import BasicPointCloud
 from utils.general_utils import strip_symmetric, build_scaling_rotation
+import math
 
 class GaussianModel:
 
@@ -57,6 +58,17 @@ class GaussianModel:
         self.percent_dense = 0
         self.spatial_lr_scale = 0
         self.setup_functions()
+
+        #
+        self._o_xyz = torch.empty(0)
+        self._o_features_dc = torch.empty(0)
+        self._o_features_rest = torch.empty(0)
+        self._o_opacity = torch.empty(0)
+        self._o_scaling = torch.empty(0)
+        self._o_rotation = torch.empty(0)
+        self._o_xyz_gradient_accum = torch.empty(0)
+        self._o_denom = torch.empty(0)
+        self._o_max_radii2D = torch.empty(0)
 
     def capture(self):
         return (
@@ -271,6 +283,7 @@ class GaussianModel:
         return optimizable_tensors
 
     def _prune_optimizer(self, mask):
+        # print('++++++++++PRUNE++++++++++')
         optimizable_tensors = {}
         for group in self.optimizer.param_groups:
             stored_state = self.optimizer.state.get(group['params'][0], None)
@@ -281,12 +294,53 @@ class GaussianModel:
                 del self.optimizer.state[group['params'][0]]
                 group["params"][0] = nn.Parameter((group["params"][0][mask].requires_grad_(True)))
                 self.optimizer.state[group['params'][0]] = stored_state
-
                 optimizable_tensors[group["name"]] = group["params"][0]
+
             else:
                 group["params"][0] = nn.Parameter(group["params"][0][mask].requires_grad_(True))
                 optimizable_tensors[group["name"]] = group["params"][0]
         return optimizable_tensors
+
+    def save_optimizer(self):
+        ll = []
+        ll2 = []
+        ll3 = []
+        optimizable_tensors = {}
+        for group in self.optimizer.param_groups:
+            stored_state = self.optimizer.state.get(group['params'][0], None)
+            ll.append(stored_state["exp_avg"])
+            ll2.append(stored_state["exp_avg_sq"])
+            ll3.append(group["params"][0])
+        #
+        #     if stored_state is not None:
+        #         self.stored_state_exp_avg = stored_state["exp_avg"]
+        #
+        #         self.stored_state_exp_avg_sq = stored_state["exp_avg_sq"]
+        #
+        #         del self.optimizer.state[group['params'][0]]
+        #         group["params"][0] = nn.Parameter((group["params"][0].requires_grad_(True)))
+        #         self.optimizer.state[group['params'][0]] = stored_state
+        #         optimizable_tensors[group["name"]] = group["params"][0]
+        #
+        #     else:
+        #         group["params"][0] = nn.Parameter(group["params"][0].requires_grad_(True))
+        #         optimizable_tensors[group["name"]] = group["params"][0]
+        # print("OPOPOPPOPOPOPOPOP : ",optimizable_tensors)
+        return ll, ll2, ll3
+
+    def restore_optimizer(self, exp_avg_list, exp_avg_sq_list, ll3):
+        i = 0
+        for group in self.optimizer.param_groups:
+            stored_state = self.optimizer.state.get(group['params'][0], None)
+            if stored_state is not None:
+                stored_state["exp_avg"] = exp_avg_list[i]
+                stored_state["exp_avg_sq"] = exp_avg_sq_list[i]
+                group["params"][0] = ll3[i]
+            else:
+                group["params"][0] = ll3[i]
+
+            i = i+1
+
 
     def prune_points(self, mask):
         valid_points_mask = ~mask
@@ -405,3 +459,166 @@ class GaussianModel:
     def add_densification_stats(self, viewspace_point_tensor, update_filter):
         self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter,:2], dim=-1, keepdim=True)
         self.denom[update_filter] += 1
+
+
+    ## grads 20231212 updated
+
+    def bool_mask_to_dict(self, mask):
+        result_dict = {str(idx): bool_val for idx, bool_val in enumerate(mask.cpu().numpy())}
+        return result_dict
+
+    def calculate_grad(self, mask):
+        grads = self.xyz_gradient_accum / self.denom
+        grads[grads.isnan()] = 0.0
+        return grads
+
+    def update_tensor_by_indices(self, target_tensor, new_values, indices):
+        updated_tensor = torch.zeros_like(target_tensor)
+        updated_tensor[indices] = new_values
+        return updated_tensor
+
+    def move_specific_points(self, selected_pts_mask):
+        stds = self.get_scaling[selected_pts_mask].repeat(1, 1)
+        means = torch.zeros((stds.size(0), 3), device="cuda")
+
+        samples = torch.normal(mean=means, std=stds)
+        rots = build_rotation(self._rotation[selected_pts_mask]).repeat(1, 1, 1)
+
+        new_xyz = torch.bmm(rots, samples.unsqueeze(-1)).squeeze(-1) + self.get_xyz[selected_pts_mask].repeat(1, 1)
+
+        #######
+        ####### stds 분포로 이동
+        # selected_pts_xyz = self.get_xyz[selected_pts_mask]
+        # # 점들의 개수와 이동할 거리 설정
+        # num_points = selected_pts_xyz.size(0)
+        # distance = 0.1  # 이동할 거리
+        #
+        # # 각 점에 대해 랜덤한 방향(각도) 생성
+        # phis = torch.rand(num_points) * math.pi  # theta 각도 설정 (0~pi)
+        # thetas = torch.rand(num_points) * 2 * math.pi  # phi 각도 설정 (0~2pi)
+        #
+        # # 각 점들의 이동 거리 계산
+        # delta_x = distance * torch.sin(torch.rand(num_points) * math.pi) * torch.cos(torch.rand(num_points) * 2 * math.pi)
+        # delta_y = distance * torch.sin(torch.rand(num_points) * math.pi) * torch.sin(torch.rand(num_points) * 2 * math.pi)
+        # delta_z = distance * torch.cos(torch.rand(num_points) * math.pi)
+        #
+        # # 기존 좌표에 랜덤한 방향으로 일정 거리만큼 이동하여 새로운 좌표 계산
+        # delta_x = delta_x.to(selected_pts_xyz.device)
+        # new_x = selected_pts_xyz[:, 0] + delta_x
+        #
+        # delta_y = delta_y.to(selected_pts_xyz.device)
+        # new_y = selected_pts_xyz[:, 1] + delta_y
+        #
+        # delta_z = delta_z.to(selected_pts_xyz.device)
+        #
+        # new_z = selected_pts_xyz[:, 2] + delta_z
+        #
+        # # 새로운 좌표로 업데이트
+        # new_xyz = torch.stack((new_x, new_y, new_z), dim=1)
+        ######
+
+
+        ###
+        selected_pts_xyz = self.get_xyz[selected_pts_mask]
+        # 각 점들에 대해 랜덤한 방향 벡터 생성
+        # selected_pts_xyz는 CUDA 장치에 있고, delta_xyz를 생성할 때도 동일한 장치에 위치시킵니다.
+        device = selected_pts_xyz.device
+
+        # 각 점들에 대해 랜덤한 방향 벡터 생성
+        num_points = selected_pts_xyz.shape[0]
+        phis = torch.rand(num_points, device=device) * math.pi  # theta 각도 설정 (0~pi)
+        thetas = torch.rand(num_points, device=device) * 2 * math.pi  # phi 각도 설정 (0~2pi)
+
+        # 극 좌표를 직교 좌표로 변환
+        directions = torch.stack([
+            torch.sin(phis) * torch.cos(thetas),
+            torch.sin(phis) * torch.sin(thetas),
+            torch.cos(phis)
+        ], dim=1)
+
+        # 각 점에 대해 랜덤 방향으로 이동하기 위한 거리 설정 (예를 들어, 모든 점이 동일한 거리로 이동)
+        distance = torch.rand(num_points, device=device)  # 적절한 거리 설정
+        # print("Distance : ", distance)
+        # 각 점마다 랜덤 방향으로 일정 거리만큼 이동
+        delta_xyz = directions * distance.view(-1, 1)
+        new_xyz = selected_pts_xyz + delta_xyz
+        ###
+        # print("new_xyz : ",new_xyz.size()) # 20000개로 고정됨
+        new_scaling = self.scaling_inverse_activation(self.get_scaling[selected_pts_mask].repeat(1, 1) / (0.8 * 1))
+        new_rotation = self._rotation[selected_pts_mask].repeat(1, 1)
+        new_features_dc = self._features_dc[selected_pts_mask].repeat(1, 1, 1)
+        new_features_rest = self._features_rest[selected_pts_mask].repeat(1, 1, 1)
+        new_opacity = self._opacity[selected_pts_mask].repeat(1, 1)
+
+        indices = torch.nonzero(selected_pts_mask).squeeze()
+
+        # 각 변수 업데이트
+        self._xyz = self.update_tensor_by_indices(self._xyz, new_xyz, indices)
+        self._scaling = self.update_tensor_by_indices(self._scaling, new_scaling, indices)
+        self._rotation = self.update_tensor_by_indices(self._rotation, new_rotation, indices)
+        self._features_dc = self.update_tensor_by_indices(self._features_dc, new_features_dc, indices)
+        self._features_rest = self.update_tensor_by_indices(self._features_rest, new_features_rest, indices)
+        self._opacity = self.update_tensor_by_indices(self._opacity, new_opacity, indices)
+
+        return new_xyz
+
+    def save_original_params(self):
+        self._o_xyz = self._xyz
+        self._o_features_dc = self._features_dc
+        self._o_features_rest = self._features_rest
+        self._o_opacity = self._opacity
+        self._o_scaling = self._scaling
+        self._o_rotation = self._rotation
+        self._o_xyz_gradient_accum = self.xyz_gradient_accum
+        self._o_denom = self.denom
+        self._o_max_radii2D = self.max_radii2D
+
+    def reset_grads(self):
+        # TODO : reset grads
+        self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+        self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+        self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+
+    def reset_params(self):
+        self._xyz = self._o_xyz
+        self._features_dc = self._o_features_dc
+        self._features_rest = self._o_features_rest
+        self._opacity = self._o_opacity
+        self._scaling = self._o_scaling
+        self._rotation = self._o_rotation
+        self.xyz_gradient_accum = self._o_xyz_gradient_accum
+        self.denom = self._o_denom
+        self.max_radii2D = self._o_max_radii2D
+
+    def filter_removed_points(self, mask):
+        valid_points_mask = mask
+        # print("Mask size : ", mask.size())
+        optimizable_tensors = self._prune_optimizer(valid_points_mask)
+
+        self._xyz = optimizable_tensors["xyz"]
+        self._features_dc = optimizable_tensors["f_dc"]
+        self._features_rest = optimizable_tensors["f_rest"]
+        self._opacity = optimizable_tensors["opacity"]
+        self._scaling = optimizable_tensors["scaling"]
+        self._rotation = optimizable_tensors["rotation"]
+
+        self.xyz_gradient_accum = self.xyz_gradient_accum[valid_points_mask]
+
+        self.denom = self.denom[valid_points_mask]
+        self.max_radii2D = self.max_radii2D[valid_points_mask]
+
+    def filter_points(self, mask):
+        valid_points_mask = ~mask
+        optimizable_tensors = self._prune_optimizer(valid_points_mask)
+
+        self._xyz = optimizable_tensors["xyz"]
+        self._features_dc = optimizable_tensors["f_dc"]
+        self._features_rest = optimizable_tensors["f_rest"]
+        self._opacity = optimizable_tensors["opacity"]
+        self._scaling = optimizable_tensors["scaling"]
+        self._rotation = optimizable_tensors["rotation"]
+
+        self.xyz_gradient_accum = self.xyz_gradient_accum[valid_points_mask]
+
+        self.denom = self.denom[valid_points_mask]
+        self.max_radii2D = self.max_radii2D[valid_points_mask]
