@@ -160,7 +160,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 # print('Train')
 
                 # Densification
-                if iteration < opt.densify_until_iter:
+                if iteration < 25000:
                     # Keep track of max radii in image-space for pruning
 
                     # TODO : gradient calculate using moved points
